@@ -1,0 +1,9 @@
+NN_NewComsol.mph
+solved/*
+images/*
+CNN/.venv
+CNN/training_history.png
+CNN/mode_cnn_model.pth
+CNN/data
+TrainingData
+SimulationEngine/bin
