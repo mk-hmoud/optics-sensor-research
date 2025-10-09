@@ -1,4 +1,6 @@
 import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
@@ -8,6 +10,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.function.Consumer;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import com.comsol.model.Model;
@@ -15,153 +18,173 @@ import com.comsol.model.util.*;
 
 public class SimRun {
 
-    public record Configuration(
-        double initialEigenvalueSearch,
-        double largeStep,
-        double smallStep,
-        int maxIterations,
-        String numberOfEigenValues,
-        String modelPath,
-        String imagesDir,
-        String solvedModelPath,
-        String pythonExecutablePath,
-        String scriptPath,
-        File pythonDir
-    ) {}
+    // --- DATA STRUCTURES ---
+	public record Configuration(
+	        double n_ana, 
+	        double initialEigenvalueSearch, 
+	        double largeStep, 
+	        double smallStep,
+	        int maxIterations, 
+	        String numberOfEigenValues, 
+	        String modelPath,
+	        String imagesDir, 
+	        String resultsCsvPath
+	    ) {}
 
-    public static void main(String[] args) {
-        // --- CONFIGURATION ---
-        Configuration config = new Configuration(
-            1.200,    // initialEigenvalueSearch
-            0.035,     // largeStep
-            0.007,    // smallStep
-            15,       // maxIterations
-            "4",      // numberOfEigenValues
-            "C:\\Users\\mhmdh\\OneDrive\\Desktop\\optics-sensor-research\\NN_NewComsol.mph",
-            "C:\\Users\\mhmdh\\OneDrive\\Desktop\\optics-sensor-research\\images",
-            "C:\\Users\\mhmdh\\OneDrive\\Desktop\\optics-sensor-research\\solved\\NN_NewComsol_Optimized.mph",
-            "C:\\Users\\mhmdh\\OneDrive\\Desktop\\optics-sensor-research\\CNN\\.venv\\Scripts\\python.exe",
-            "C:\\Users\\mhmdh\\OneDrive\\Desktop\\optics-sensor-research\\CNN\\categorize.py",
-            new File("C:\\Users\\mhmdh\\OneDrive\\Desktop\\optics-sensor-research\\CNN")
-        );
-        
-        Model model = null;
-        try {
-            model = initializeAndLoadModel(config.modelPath);
-            runOptimizationLoop(model, config);
-        } catch (Exception e) {
-            System.err.println("A fatal error occurred in the main process: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            if (model != null) {
-                System.out.println("Disconnecting and shutting down engine.");
-                ModelUtil.disconnect();
-            }
-        }
+	    public record ComplexNumber(double real, double imag) {
+	        @Override public String toString() {
+	            return String.format("%.6f + (%.6f)i", real, imag);
+	        }
+	    }
+
+	    public record WavelengthResult(double wavelength, ComplexNumber neff, double loss) {}
+
+	    public static void runSweep(Configuration config, Consumer<String> log, double startWl, double endWl, double stepWl) {
+	        Model model = null;
+	        try {
+	            model = initializeAndLoadModel(config.modelPath, log);
+	            if (model == null) return;
+	            List<WavelengthResult> allResults = new ArrayList<>();
+
+	            for (double wl = startWl; wl <= endWl; wl += stepWl) {
+	                if (Thread.currentThread().isInterrupted()) {
+	                    log.accept("--- Wavelength sweep cancelled by user ---");
+	                    break;
+	                }
+	                log.accept(String.format("\n\n<<<<<<<< PROCESSING WAVELENGTH: %.1f nm >>>>>>>>\n", wl));
+	                
+	                ComplexNumber fundamentalMode = findFundamentalMode(model, config, wl, log);
+	                
+	                if (fundamentalMode != null) {
+	                    double loss = calculateLoss(fundamentalMode);
+	                    allResults.add(new WavelengthResult(wl, fundamentalMode, loss));
+	                    log.accept(String.format("SUCCESS for %.1f nm. Loss: %.4f dB/cm", wl, loss));
+	                } else {
+	                    log.accept(String.format("FAILURE for %.1f nm. Could not find fundamental mode.", wl));
+	                }
+	            }
+	            if (!Thread.currentThread().isInterrupted()) {
+	                exportResultsToCSV(allResults, config.resultsCsvPath, log);
+	            } 
+
+	        } catch (Exception e) {
+	            log.accept("A fatal error occurred: " + e.getMessage());
+	            e.printStackTrace();
+	        } finally {
+	            if (model != null) {
+	                log.accept("Disconnecting and shutting down engine.");
+	                ModelUtil.disconnect();
+	            }
+	        }
+	    }
+
+    /**
+     * The optimization loop that searches for the fundamental mode for a GIVEN WAVELENGTH.
+     * @return The ComplexNumber of the fundamental mode, or null if not found.
+     */
+	    public static ComplexNumber findFundamentalMode(Model model, Configuration config, double wavelengthNm, Consumer<String> log) throws Exception {
+	        model.param().set("w_length", wavelengthNm + "[nm]");
+	        model.param().set("n_ana", String.valueOf(config.n_ana));
+	        log.accept(String.format("Set model params: w_length=%.1f[nm], n_ana=%.4f", wavelengthNm, config.n_ana));
+
+	        double currentEigenvalueSearch = config.initialEigenvalueSearch;
+	        double currentStep = config.largeStep;
+	        int previousDirection = 0;
+
+	        for (int iteration = 1; iteration <= config.maxIterations; iteration++) {
+	        	if (Thread.currentThread().isInterrupted()) {
+	                log.accept("--- Optimization loop cancelled by user ---");
+	                return null;
+	            }
+	            log.accept(String.format("\n--- Iteration #%d (Search: %.4f) ---", iteration, currentEigenvalueSearch));
+
+	            runSimulationAndExport(model, currentEigenvalueSearch, config.numberOfEigenValues, config.imagesDir, log);
+	            List<String> predictions = runPrediction(config, log);
+
+	            int fundamentalCount = 0, higherCount = 0, lowerCount = 0, firstFundamentalIndex = -1;
+	            for (int i = 0; i < predictions.size(); i++) {
+	                String p = predictions.get(i);
+	                if (p.equals("fundamental")) {
+	                    fundamentalCount++;
+	                    if (firstFundamentalIndex == -1) { firstFundamentalIndex = i; }
+	                } else if (p.equals("higher")) {
+	                    higherCount++;
+	                } else if (p.equals("lower")) {
+	                    lowerCount++;
+	                }
+	            }
+	            
+	            if (fundamentalCount == 2) {
+	                log.accept("Found a pair of fundamental modes!");
+	                String tempOutputFile = config.imagesDir + File.separator + "effectiveModeIndexes.txt";
+	                return getEigenvalueFromFileByIndex(tempOutputFile, firstFundamentalIndex, log);
+	            } 
+	            
+	            log.accept("\nINFO: Did not find a pair of fundamental modes. Analyzing results for next step.");
+	            
+	            int currentDirection = 0;
+	            if (higherCount > lowerCount) currentDirection = -1;
+	            else if (lowerCount > higherCount) currentDirection = 1;
+
+	            if (currentDirection != 0 && (currentDirection == -previousDirection)) {
+	                if (currentStep == config.largeStep) {
+	                    log.accept("----> OVERSHOT TARGET! Switching from large steps to small steps.");
+	                    currentStep = config.smallStep;
+	                }
+	            }
+	            
+	            if (currentDirection == 0) {
+	                 log.accept("----> Ambiguous result. Keeping search value the same for next iteration.");
+	            } else {
+	                 log.accept(String.format("----> Adjusting search value. Old: %.4f, Step: %.4f, New: %.4f", 
+	                                   currentEigenvalueSearch, (currentDirection * currentStep), (currentEigenvalueSearch + currentDirection * currentStep)));
+	                 currentEigenvalueSearch += currentDirection * currentStep;
+	            }
+	            
+	            if (currentDirection != 0) previousDirection = currentDirection;
+	            if (iteration == config.maxIterations) log.accept("\nFAILURE: Reached max iterations without finding the fundamental mode pair.");
+	        }
+	        return null;
+	    }
+
+    /**
+     * Calculates the propagation loss in dB/cm based on your formula.
+     */
+    public static double calculateLoss(ComplexNumber neff) {
+        // loss = 8.686 * 2 * PI * Im(neff) * 10^6 / Re(neff)
+        if (neff.real() == 0) return Double.NaN;
+        return 8.686 * 2 * Math.PI * neff.imag() * 1e6 / neff.real();
     }
 
     /**
-     * Loop that looks for fundamental mode.
+     * Writes the collected results to a CSV file.
      */
-    public static void runOptimizationLoop(Model model, Configuration config) throws Exception {
-        ComplexNumber fundamentalModeEigenvalue = null;
-        double currentEigenvalueSearch = config.initialEigenvalueSearch;
-        double currentStep = config.largeStep;
-        int previousDirection = 0;
-
-        for (int iteration = 1; iteration <= config.maxIterations; iteration++) {
-            System.out.printf("\n==================== ITERATION #%d / %d ====================\n", iteration, config.maxIterations);
-
-            runSimulationAndExport(model, currentEigenvalueSearch, config.numberOfEigenValues, config.imagesDir);
-            List<String> predictions = runPrediction(config);
-
-            // --- Analysis Logic ---
-            int fundamentalCount = 0;
-            int higherCount = 0;
-            int lowerCount = 0;
-            int firstFundamentalIndex = -1;
-
-            for (int i = 0; i < predictions.size(); i++) {
-                String p = predictions.get(i);
-                if (p.equals("fundamental")) {
-                    fundamentalCount++;
-                    if (firstFundamentalIndex == -1) {
-                        firstFundamentalIndex = i;
-                    }
-                } else if (p.equals("higher")) {
-                    higherCount++;
-                } else if (p.equals("lower")) {
-                    lowerCount++;
-                }
-            }
-            // Simulation output should have two fundamental modes, if only 1 was detected.. means model mistakenly labeled a fundamental mode.
-            if (fundamentalCount == 2) {
-                System.out.println("\nSUCCESS: Found exactly two fundamental modes! Stopping optimization.");
-                String tempOutputFile = config.imagesDir + "\\effectiveModeIndexes.txt";
-                fundamentalModeEigenvalue = getEigenvalueFromFileByIndex(tempOutputFile, firstFundamentalIndex);
-                break;
-            } 
-            
-            System.out.println("\nINFO: Did not find a pair of fundamental modes. Analyzing results for next step.");
-            
-
-            // Change direction based on lower or higher returned
-            int currentDirection = 0;
-            if (higherCount > lowerCount) {
-                currentDirection = -1;
-            } else if (lowerCount > higherCount) {
-                currentDirection = 1;
-            }
-            
-            // Standard adaptive step logic
-            if (currentDirection != 0 && (currentDirection == -previousDirection)) {
-                if (currentStep == config.largeStep) {
-                    System.out.println("----> OVERSHOT TARGET! Switching from large steps to small steps.");
-                    currentStep = config.smallStep;
-                }
-            }
-            
-            if (currentDirection == 0) {
-                 System.out.println("----> Ambiguous result. Keeping search value the same for next iteration.");
-            } else {
-                 System.out.printf("----> Adjusting search value. Old: %.4f, Step: %.4f, New: %.4f\n", 
-                                   currentEigenvalueSearch, (currentDirection * currentStep), (currentEigenvalueSearch + currentDirection * currentStep));
-                 currentEigenvalueSearch += currentDirection * currentStep;
-            }
-            
-            if (currentDirection != 0) {
-                previousDirection = currentDirection;
-            }
-
-            if (iteration == config.maxIterations) {
-                System.out.println("\nFAILURE: Reached max iterations without finding the fundamental mode pair.");
+    public static void exportResultsToCSV(List<WavelengthResult> results, String filePath, Consumer<String> log) throws IOException {
+        log.accept("\n--- Exporting final results to " + filePath + " ---");
+        try (PrintWriter writer = new PrintWriter(new FileWriter(filePath))) {
+            writer.println("Wavelength (nm),Re(neff),Im(neff),Loss (dB/cm)");
+            for (WavelengthResult res : results) {
+                writer.printf("%.2f,%.6f,%.6f,%.6f\n",
+                    res.wavelength, res.neff.real(), res.neff.imag(), res.loss);
             }
         }
-
-        if (fundamentalModeEigenvalue != null) {
-            System.out.println("\n==================== OPTIMIZATION COMPLETE ====================");
-            System.out.println("Fundamental Mode Eigenvalue: " + fundamentalModeEigenvalue);
-            System.out.println("Found at search parameter value: " + currentEigenvalueSearch);
-            System.out.println("\nSaving final solved model to: " + config.solvedModelPath);
-            model.save(config.solvedModelPath);
-            System.out.println("Model saved.");
-        }
+        log.accept("Export complete.");
     }
-
+    
     /**
      * Initializes the COMSOL engine and loads the model file.
      */
-    public static Model initializeAndLoadModel(String modelPath) {
+    public static Model initializeAndLoadModel(String modelPath, Consumer<String> log) {
         try {
-            System.out.println("Starting COMSOL engine...");
+            log.accept("Starting COMSOL engine...");
             ModelUtil.initStandalone(false);
-            System.out.println("Engine launched.");
-            System.out.println("Loading model: " + modelPath);
+            log.accept("Engine launched.");
+            log.accept("Loading model: " + modelPath);
             Model model = ModelUtil.load("MyModelTag", modelPath);
-            System.out.println("Model loaded successfully.");
+            log.accept("Model loaded successfully.");
             return model;
         } catch (IOException e) {
-            System.err.println("❌ Failed to load model: " + e.getMessage());
+            log.accept("Failed to load model: " + e.getMessage());
             e.printStackTrace();
             return null;
         }
@@ -170,21 +193,21 @@ public class SimRun {
     /**
      * Sets parameters, runs the solver, and exports result images.
      */
-    public static void runSimulationAndExport(Model model, double currentShift, String numEigs, String imagesDir) {
-        System.out.printf("Setting 'Search for eigenvalues around' to: %.4f\n", currentShift);
+    public static void runSimulationAndExport(Model model, double currentShift, String numEigs, String imagesDir, Consumer<String> log) {
+        log.accept(String.format("Setting 'Search for eigenvalues around' to: %.4f", currentShift));
         model.sol("sol1").feature("e1").set("shift", String.valueOf(currentShift));
         model.sol("sol1").feature("e1").set("neigs", numEigs);
         
-        System.out.println("Running solver (sol1)...");
+        log.accept("Running solver (sol1)...");
         model.sol("sol1").runAll();
-        System.out.println("Solver run complete.");
+        log.accept("Solver run complete.");
         
-        System.out.println("--- Exporting plots for all available modes ---");
+        log.accept("--- Exporting plots for all available modes ---");
         int plotsExported = 0;
         for (int i = 1; i < 1000; i++) {
             try {
                 model.result("pg1").set("looplevel", i);
-                String imageOutputPath = String.format("%s\\mode_plot_%d.png", imagesDir, i);
+                String imageOutputPath = imagesDir + File.separator + String.format("mode_plot_%d.png", i);
                 model.result().export("img1").set("filename", imageOutputPath);
                 model.result().export("img1").run();
                 plotsExported++;
@@ -192,14 +215,23 @@ public class SimRun {
                 break; 
             }
         }
-        System.out.println("Exported " + plotsExported + " plots.");
+        log.accept("--- Exporting eigenvalue data to file ---");
+        try {
+            String tempOutputFile = imagesDir + File.separator + "effectiveModeIndexes.txt";
+            model.result().export("data1").set("filename", tempOutputFile);
+            model.result().export("data1").run();
+            log.accept("Eigenvalue data exported successfully.");
+        } catch (Exception e) {
+            log.accept("ERROR: Failed to export eigenvalue data file. Check if the export node with tag 'data1' exists and is configured correctly.");
+            e.printStackTrace();
+        }
     }
 
     /**
      * HTTP request to the CNN MODEL server.
      */
-    public static List<String> runPrediction(Configuration config) throws java.io.IOException, InterruptedException {
-        System.out.println("\n--- Sending prediction request to Python server ---");
+    public static List<String> runPrediction(Configuration config, Consumer<String> log) throws java.io.IOException, InterruptedException {
+        log.accept("\n--- Sending prediction request to Python server ---");
         
         HttpClient client = HttpClient.newHttpClient();
         String jsonBody = "{\"image_dir\": \"" + config.imagesDir.replace("\\", "\\\\") + "\"}";
@@ -212,14 +244,12 @@ public class SimRun {
 
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
         
-        System.out.println("Python Server Response (Status Code " + response.statusCode() + "):");
+        log.accept("Python Server Response (Status Code " + response.statusCode() + "):");
         String responseBody = response.body();
 
-        // --- PRETTY-PRINT JSON ---
         JSONArray jsonArray = new JSONArray(responseBody);
-        System.out.println(jsonArray.toString(4));
+        log.accept(jsonArray.toString(4));
 
-        // --- PARSE ---
         List<String> predictions = new ArrayList<>();
         for (int i = 0; i < jsonArray.length(); i++) {
             JSONObject obj = jsonArray.getJSONObject(i);
@@ -228,15 +258,8 @@ public class SimRun {
             }
         }
         
-        System.out.println("Python script finished. Parsed " + predictions.size() + " predictions.");
+        log.accept("API request finished. Parsed " + predictions.size() + " predictions.");
         return predictions;
-    }
-    
-    public record ComplexNumber(double real, double imag) {
-        @Override
-        public String toString() {
-            return String.format("%.4f + (%.7f)i", real, imag);
-        }
     }
     
     /**
@@ -245,7 +268,7 @@ public class SimRun {
      * @param modeIndex The index of the mode to fetch.
      * @return ComplexNumber object for the mode.
      */
-    public static ComplexNumber getEigenvalueFromFileByIndex(String filePath, int modeIndex) throws java.io.IOException {
+    public static ComplexNumber getEigenvalueFromFileByIndex(String filePath, int modeIndex, Consumer<String> log) throws java.io.IOException {
         File file = new File(filePath);
         try (java.util.Scanner scanner = new java.util.Scanner(file)) {
             while (scanner.hasNextLine()) {
