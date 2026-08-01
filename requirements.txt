@@ -1,0 +1,5 @@
+numpy
+matplotlib
+MPh>=1.2.4
+scipy
+jpype1  # Required by MPh
